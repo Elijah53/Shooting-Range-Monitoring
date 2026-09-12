@@ -139,3 +139,4 @@ shooting_range_system/
 RFID/barcode-based weapon-ownership verification, multi-person tracking,
 anti-spoofing, ballistic/ammunition tracking, cloud deployment, mobile
 app, distributed architecture.
+# Shooting-Range-Monitoring

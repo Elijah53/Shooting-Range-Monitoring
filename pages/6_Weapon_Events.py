@@ -13,6 +13,18 @@ st.title("🔫 Weapon Events & Inventory")
 
 tab_events, tab_inventory = st.tabs(["Weapon Events", "Weapon Inventory"])
 
+# Pre-fetch inventory weapons once for use in both tabs
+inventory_weapons = fetch_all("SELECT * FROM weapons ORDER BY weapon_id")
+# Dropdown options: "W001 – Glock 19 (Available)", etc.
+STATUS_ICON = {"Available": "🟢", "In Use": "🔴", "Maintenance": "🟡"}
+
+def weapon_dropdown_options(weapons: list) -> list[str]:
+    """Build label list for weapon selectbox from inventory."""
+    return [
+        f"{w['weapon_id']} – {w['weapon_type']} ({STATUS_ICON.get(w['status'], '')} {w['status']})"
+        for w in weapons
+    ]
+
 with tab_events:
     c1, c2, c3 = st.columns(3)
     date_from = c1.date_input("From", value=date.today() - timedelta(days=7), key="we_date_from")
@@ -56,9 +68,12 @@ with tab_events:
         st.markdown("---")
         st.subheader("✏️ Manual Verification & Type Override")
         st.caption(
-            "Operators can correct or specify a more detailed weapon type (e.g., Service Revolver vs Semi-Auto). "
+            "Operators can select the exact weapon from inventory or correct the AI-detected type. "
             "The original AI-detected value is permanently preserved for auditing."
         )
+
+        inv_labels = weapon_dropdown_options(inventory_weapons)
+        has_inventory = bool(inv_labels)
 
         # 2. Per-event edit controls (recent 15 events)
         for e in events[:15]:
@@ -74,20 +89,51 @@ with tab_events:
 
             with st.expander(exp_label, expanded=False):
                 ec1, ec2, ec3 = st.columns([3, 3, 2])
+
                 with ec1:
-                    override_val = st.text_input(
-                        "Specific / Verified Weapon Type",
-                        value=curr_weapon,
-                        key=f"manual_wpn_{eid}",
-                        help="Enter the exact weapon model or subtype (e.g. Service Revolver, AK-47, Glock 19).",
-                    )
+                    if has_inventory:
+                        # Try to preselect the matching inventory item
+                        preselect_idx = 0
+                        for i, lbl in enumerate(inv_labels):
+                            if curr_weapon.lower() in lbl.lower():
+                                preselect_idx = i
+                                break
+
+                        use_inventory = st.checkbox(
+                            "Select from Inventory",
+                            value=True,
+                            key=f"use_inv_{eid}",
+                        )
+
+                        if use_inventory:
+                            chosen_label = st.selectbox(
+                                "Select Weapon from Inventory",
+                                inv_labels,
+                                index=preselect_idx,
+                                key=f"inv_sel_{eid}",
+                            )
+                            # Extract type: "W001 – Glock 19 (🟢 Available)" → "Glock 19"
+                            override_val = chosen_label.split("–", 1)[1].rsplit("(", 1)[0].strip()
+                        else:
+                            override_val = st.text_input(
+                                "Specific / Verified Weapon Type",
+                                value=curr_weapon,
+                                key=f"manual_wpn_{eid}",
+                            )
+                    else:
+                        override_val = st.text_input(
+                            "Specific / Verified Weapon Type",
+                            value=curr_weapon,
+                            key=f"manual_wpn_{eid}",
+                        )
+
                 with ec2:
                     operator_name = st.text_input(
                         "Verified by (Operator Name)",
                         value=e.get("manually_verified_by") or "",
                         key=f"verifier_{eid}",
-                        placeholder="e.g. Officer Smith",
                     )
+
                 with ec3:
                     st.write("")
                     st.write("")
@@ -108,25 +154,35 @@ with tab_events:
 with tab_inventory:
     st.subheader("Inventory Management")
     st.caption(
-        "Physical weapon inventory catalog. Note: Hardware inventory items are independent "
-        "from real-time vision category logs."
+        "Manage the physical weapon catalog. "
+        "🟢 Available weapons are shown in Manual Verification dropdowns. "
+        "Mark weapons as 🔴 In Use or 🟡 Maintenance to reflect their real-world status."
     )
 
-    weapons = fetch_all("SELECT * FROM weapons ORDER BY weapon_id")
-    if not weapons:
-        st.caption("No weapons registered in inventory.")
+    if not inventory_weapons:
+        st.info("No weapons registered in inventory yet. Add one below.")
     else:
-        for w in weapons:
-            cols = st.columns([2, 3, 3])
-            cols[0].markdown(f"**`{w['weapon_id']}`**")
-            cols[1].write(w["weapon_type"])
+        # Header row
+        hc1, hc2, hc3 = st.columns([2, 4, 3])
+        hc1.markdown("**Weapon ID**")
+        hc2.markdown("**Type / Model**")
+        hc3.markdown("**Status**")
+        st.markdown("<hr style='margin:4px 0 8px 0;'>", unsafe_allow_html=True)
+
+        for w in inventory_weapons:
             curr_st = w["status"] if w["status"] in ["Available", "In Use", "Maintenance"] else "Available"
+            icon = STATUS_ICON.get(curr_st, "")
+
+            cols = st.columns([2, 4, 3])
+            cols[0].markdown(f"**`{w['weapon_id']}`**")
+            cols[1].markdown(f"{w['weapon_type']}")
             new_status = cols[2].selectbox(
-                "Status",
+                f"status_{w['weapon_id']}",
                 ["Available", "In Use", "Maintenance"],
                 index=["Available", "In Use", "Maintenance"].index(curr_st),
                 key=f"inv_status_{w['weapon_id']}",
                 label_visibility="collapsed",
+                format_func=lambda s: f"{STATUS_ICON.get(s, '')} {s}",
             )
             if new_status != w["status"]:
                 execute("UPDATE weapons SET status = %s WHERE weapon_id = %s", (new_status, w["weapon_id"]))
@@ -135,10 +191,10 @@ with tab_inventory:
 
     st.markdown("---")
     with st.expander("➕ Register New Inventory Weapon", expanded=False):
-        wtype = st.text_input("Weapon type / model (e.g. Pistol 9mm, AR-15, Shotgun 12GA)")
+        wtype = st.text_input("Weapon type / model", key="new_weapon_type_input")
         if st.button("Add to Inventory", type="primary"):
             if wtype.strip():
-                existing_ids = [w["weapon_id"] for w in weapons] if weapons else []
+                existing_ids = [w["weapon_id"] for w in inventory_weapons] if inventory_weapons else []
                 new_id = next_weapon_id(existing_ids)
                 execute(
                     "INSERT INTO weapons (weapon_id, weapon_type, status) VALUES (%s, %s, 'Available')",

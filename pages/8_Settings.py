@@ -7,11 +7,7 @@ require_db_or_stop()
 
 st.title("Settings")
 
-st.markdown(
-    "These values are stored in the database (`app_settings` table) so "
-    "they can be changed here without editing `.env` or restarting. "
-    "`.env` values are still used as the *initial* defaults on first run."
-)
+
 
 row = fetch_one("SELECT * FROM app_settings WHERE id = 1")
 
@@ -43,25 +39,4 @@ if submitted:
     )
     st.success("Settings saved. Some changes take effect next time you start the camera.")
 
-st.divider()
-st.subheader("Cameras / Lanes")
 
-cameras = fetch_all("SELECT * FROM cameras ORDER BY camera_id")
-st.dataframe(
-    [{"Camera": c["camera_id"], "Lane": c["lane_id"], "Status": c["status"]} for c in cameras],
-    use_container_width=True, hide_index=True,
-)
-
-with st.expander("Add camera / lane"):
-    new_cam_id = st.text_input("Camera ID (e.g. CAM-03)")
-    new_lane = st.text_input("Lane (e.g. Lane 3)")
-    if st.button("Add Camera"):
-        if new_cam_id and new_lane:
-            execute(
-                "INSERT INTO cameras (camera_id, lane_id, status) VALUES (%s, %s, 'Online')",
-                (new_cam_id, new_lane),
-            )
-            st.success("Camera added.")
-            st.rerun()
-        else:
-            st.error("Both fields are required.")

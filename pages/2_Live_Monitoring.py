@@ -5,14 +5,15 @@ State-Driven Front Desk Reception & Kiosk Terminal
 
 Workflow:
 1. Sequential Two-Step Check-In:
-   - Step 1: Face Detection & Biometric Recognition (Pehle Face Detect)
-   - Step 2: Weapon Safety Inspection & Classification (Than Weapon Detect)
+   - Step 1: Shooter Biometric Recognition
+   - Step 2: Weapon Safety Inspection (Multi-Class YOLO)
    - When both verified -> Confirm Check-In & Start Range Session.
-2. Manual Session End (Session End via Camera Removed):
-   - Dedicated "Active Shooters on Range" panel with 1-click "End Session / Check-Out".
+2. Manual Session End:
+   - "Active Shooters on Range" panel with 1-click "End Session / Check-Out".
 3. Flicker-Free Camera Streaming:
-   - High-performance downscaled face processing + YOLO threat detection.
-   - Non-flickering scoped live feed with stable action controls.
+   - Dedicated background thread video capture driver.
+   - Persistent Streamlit container rendering without timer-based fragment reruns.
+   - Hardware exposure & FPS locking.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import streamlit as st
 from datetime import datetime, date
 
 st.set_page_config(
-    page_title="Front Desk Kiosk — Shooting Range",
+    page_title="Check-In Station — Shooting Range",
     page_icon="🏢",
     layout="wide",
 )
@@ -41,6 +42,7 @@ try:
     from services import attendance_service, session_service, event_service
     from models.kiosk_state import KioskState, TransactionType, KioskContext
     from utils.helpers import format_dt, pct, duration_str
+    from utils import config
     require_db_or_stop()
     _imports_ok = True
 except Exception as _import_err:
@@ -52,22 +54,24 @@ if not _imports_ok:
     st.stop()
 
 
-# ── Load Settings ─────────────────────────────────────────────────────────────
-def _load_settings() -> dict:
-    row = fetch_one("SELECT * FROM app_settings WHERE id=1")
-    if row:
-        return dict(row)
-    from utils import config
-    return {
-        "face_match_threshold": config.FACE_MATCH_THRESHOLD,
-        "detection_confidence_threshold": config.DETECTION_CONFIDENCE_THRESHOLD,
-        "event_cooldown_seconds": config.EVENT_COOLDOWN_SECONDS,
-        "face_recognition_interval": config.FACE_RECOGNITION_INTERVAL,
-        "camera_source": config.CAMERA_SOURCE,
-    }
+# ── Load Live Settings ────────────────────────────────────────────────────────
+def load_live_settings():
+    row = fetch_one("SELECT * FROM app_settings WHERE id = 1")
+    base = config.load_settings()  # .env defaults as fallback
+    if not row:
+        return base
+    return base.__class__(
+        **{
+            **base.__dict__,
+            "detection_confidence_threshold": float(row["detection_confidence_threshold"]),
+            "event_cooldown_seconds": int(row["event_cooldown_seconds"]),
+            "face_recognition_interval": int(row["face_recognition_interval"]),
+            "camera_source": str(row["camera_source"]),
+        }
+    )
 
 
-settings = _load_settings()
+settings = load_live_settings()
 
 # ── Session State Initialization ──────────────────────────────────────────────
 state_defaults = {
@@ -79,9 +83,7 @@ state_defaults = {
     "face_enc_cache": None,
     "desk_lane": "Lane 1",
     "desk_cam_id": "CAM-01",
-    "auto_checkin": False,
-    "last_toast_msg": "",
-    "sim_mode": False,
+    "auto_checkin": True,
 }
 for k, v in state_defaults.items():
     if k not in st.session_state:
@@ -90,19 +92,44 @@ for k, v in state_defaults.items():
 if st.session_state.kiosk_manager is None:
     st.session_state.kiosk_manager = KioskStateManager()
 
-if st.session_state.pipeline is None:
+target_model_path = config.WEAPON_MODEL_PATH
+if (
+    st.session_state.pipeline is None
+    or getattr(st.session_state.pipeline.detector, "_model_path", None) != target_model_path
+):
     st.session_state.pipeline = DetectionPipeline(
-        weapon_detector=get_weapon_detector(),
-        face_match_threshold=float(settings.get("face_match_threshold", 0.60)),
-        weapon_confidence_threshold=float(settings.get("detection_confidence_threshold", 0.40)),
-        face_interval=int(settings.get("face_recognition_interval", 4)),
-        weapon_interval=2,
+        weapon_detector=get_weapon_detector(target_model_path),
+        face_match_threshold=float(settings.face_match_threshold),
+        weapon_confidence_threshold=float(settings.detection_confidence_threshold),
+        face_interval=int(settings.face_recognition_interval),
+        weapon_interval=1,
     )
 
 
-# ── Top Bar: Front Desk Header & Terminal Controls ─────────────────────────────
-st.title("🏢 Front Desk Reception & Kiosk Terminal")
-st.caption("Sequential Check-In Desk (Step 1: Face ID ➔ Step 2: Weapon Scan) | Manual Session End")
+# ── Helper Handlers for Actions ────────────────────────────────────────────────
+def do_checkin():
+    ctx = st.session_state.kiosk_manager.context
+    if not ctx.user_id:
+        return None
+    summary = TransactionManager.start_session(
+        ctx=ctx,
+        camera_id=st.session_state.desk_cam_id,
+        lane_id=st.session_state.desk_lane,
+        cooldown_cache=st.session_state.cooldown_cache,
+        cooldown_seconds=int(settings.event_cooldown_seconds),
+    )
+    return summary
+
+
+def do_reset():
+    st.session_state.kiosk_manager.context.reset()
+    st.session_state.kiosk_manager.face_stability_count = 0
+    st.session_state.kiosk_manager.weapon_stability_count = 0
+
+
+# ── Top Bar: Check-In Station Header & Terminal Controls ──────────────────────
+st.title("🏢 Check-In Station")
+st.caption("Reception Desk (Step 1: Face ID ➔ Step 2: Weapon Scan) | Atomic Transactions")
 
 ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([2, 2, 2, 2])
 
@@ -113,7 +140,7 @@ with ctrl_col1:
         sel_cam_label = st.selectbox("Counter Camera", list(cam_options.keys()), key="kiosk_cam_sel")
         st.session_state.desk_cam_id = cam_options[sel_cam_label]["camera_id"]
     else:
-        st.selectbox("Counter Camera", ["CAM-01 (Front Desk)"], key="kiosk_cam_sel_def")
+        st.selectbox("Counter Camera", ["CAM-01 (Reception)"], key="kiosk_cam_sel_def")
         st.session_state.desk_cam_id = "CAM-01"
 
 with ctrl_col2:
@@ -125,15 +152,15 @@ with ctrl_col3:
     st.session_state.auto_checkin = st.toggle(
         "⚡ Auto-Confirm Check-In",
         value=st.session_state.auto_checkin,
-        help="Automatically start session once Face + Weapon are verified",
+        help="Automatically execute atomic check-in transaction once Face + Weapon are verified",
     )
 
 with ctrl_col4:
-    st.write("") # vertical spacing
+    st.write("")  # vertical spacing
     if not st.session_state.camera_running:
         if st.button("▶ Start Camera Feed", type="primary", use_container_width=True):
             try:
-                cam = Camera(settings.get("camera_source", "0"))
+                cam = Camera(settings.camera_source, target_fps=30)
                 cam.start()
                 st.session_state.camera = cam
                 st.session_state.camera_running = True
@@ -156,188 +183,53 @@ with ctrl_col4:
 
 
 # ── Calibration & Sensitivity Controls ────────────────────────────────────────
-with st.expander("⚙️ Detection Sensitivity & Firearm Type Controls", expanded=False):
-    c_cal1, c_cal2, c_cal3 = st.columns([2, 2, 2])
+with st.expander("⚙️ Detection Sensitivity & Firearm Model Settings", expanded=False):
+    c_cal1, c_cal2 = st.columns([3, 3])
     with c_cal1:
-        cur_w_thresh = float(st.session_state.pipeline.weapon_threshold if st.session_state.pipeline else 0.50)
+        cur_w_thresh = float(st.session_state.pipeline.weapon_threshold if st.session_state.pipeline else settings.detection_confidence_threshold)
         new_w_thresh = st.slider(
-            "Weapon Confidence Cutoff", 0.20, 0.95, cur_w_thresh, step=0.05,
-            help="Higher values reduce false alarms. 0.50 is recommended for general indoor lighting.",
+            "Firearm Confidence Cutoff", 0.30, 0.95, cur_w_thresh, step=0.05,
+            help="Confidence threshold for YOLO firearm detection (Pistols / Rifles). Increase to eliminate false positives on everyday objects.",
             key="slider_wpn_thresh",
         )
         if st.session_state.pipeline:
             st.session_state.pipeline.weapon_threshold = new_w_thresh
+            if hasattr(st.session_state.pipeline.detector, "_confidence_threshold"):
+                st.session_state.pipeline.detector._confidence_threshold = new_w_thresh
+
     with c_cal2:
-        st.session_state["weapon_type_override"] = st.selectbox(
-            "Firearm Classification Mode",
-            [
-                "Auto (AI Gun Identifier: Glock 17, Beretta 92FS, AR-15)",
-                "Force: Glock 17",
-                "Force: Beretta 92FS",
-                "Force: Colt M1911",
-                "Force: Sig Sauer P320",
-                "Force: Desert Eagle",
-                "Force: Colt Python",
-                "Force: AR-15 / M4",
-                "Force: AK-47",
-                "Force: Remington 870",
-            ],
-            key="sel_wpn_override",
-            help="Auto identifies exact firearm model. You can also force a specific gun name.",
-        )
-    with c_cal3:
-        model_options = {
-            "Dedicated Pistol Detector (pistol_model.pt)": "model_data/pistol_model.pt",
-            "Threat Gun Model (weapon_model.pt)": "model_data/weapon_model.pt",
-            "CCTV Gun Model (cctv_gun_model.pt)": "model_data/cctv_gun_model.pt",
-        }
-        sel_model_label = st.selectbox(
-            "Gun Detection Model Weights",
-            list(model_options.keys()),
-            index=0,
-            key="sel_model_weights",
-            help="Switch between specialized firearm models. Pistol.pt is recommended for handguns.",
-        )
-        chosen_path = model_options[sel_model_label]
-        if st.session_state.pipeline and getattr(st.session_state.pipeline.detector, "_model_path", None) != chosen_path:
-            from vision.weapon_detection import get_weapon_detector
-            st.session_state.pipeline.detector = get_weapon_detector(chosen_path)
-            st.toast(f"Switched model to {sel_model_label}")
+        st.markdown("**🎯 Active Firearm Model**")
+        st.info("🛡️ **YOLO Multi-Firearm Detector** (`model_data/multi_weapon_model.pt`)\n\n*Optimized for shooting ranges (Pistols, Rifles, Long Guns).*")
 
 st.divider()
 
-# ── Helper Handlers for Actions ────────────────────────────────────────────────
-def do_checkin():
-    ctx = st.session_state.kiosk_manager.context
-    if not ctx.user_id:
-        st.error("No shooter identified.")
-        return
-    summary = TransactionManager.start_session(
-        ctx=ctx,
-        camera_id=st.session_state.desk_cam_id,
-        lane_id=st.session_state.desk_lane,
-        cooldown_cache=st.session_state.cooldown_cache,
-        cooldown_seconds=int(settings.get("event_cooldown_seconds", 5)),
-    )
-    st.success(f"🎉 Check-In Successful! {summary['user_name']} assigned to {summary['lane_id']} with {summary['weapon_type']}.")
 
-
-def do_reset():
-    st.session_state.kiosk_manager.context.reset()
-    st.session_state.kiosk_manager.face_stability_count = 0
-    st.session_state.kiosk_manager.weapon_stability_count = 0
-
-
-# ── Action Bar (Shows when ready or in progress) ───────────────────────────────
-ctx_current = st.session_state.kiosk_manager.context
-
-if ctx_current.current_state == KioskState.READY_FOR_CHECKIN:
-    ready_banner, btn_act, btn_rst = st.columns([4, 2, 1])
-    with ready_banner:
-        st.success(
-            f"🟢 **READY FOR CHECK-IN!** Verified Shooter: **{ctx_current.user_name}** | "
-            f"Weapon: **{ctx_current.weapon_type or 'Firearm'}** ({pct(ctx_current.weapon_confidence)})"
-        )
-    with btn_act:
-        if st.button("▶ Confirm Check-In & Enter", type="primary", use_container_width=True):
-            do_checkin()
-            st.rerun()
-    with btn_rst:
-        if st.button("🔄 Clear", use_container_width=True):
-            do_reset()
-            st.rerun()
-
-elif ctx_current.current_state == KioskState.SESSION_COMPLETED and ctx_current.last_completed_summary:
-    sumry = ctx_current.last_completed_summary
-    st.balloons()
-    st.success(
-        f"✅ **CHECK-IN COMPLETE!** Shooter: **{sumry['user_name']}** | Lane: **{sumry['lane_id']}** | "
-        f"Verified Weapon: **{sumry['weapon_type']}** | Time: **{sumry['time']}**"
-    )
-
-
-# ── Live Monitoring Viewport & Two-Step Verification Fragment ─────────────────
-
-@st.fragment(run_every=0.15)
-def live_feed_and_stages_fragment():
-    v_col, s_col = st.columns([3, 2])
-
-    kiosk_mgr: KioskStateManager = st.session_state.kiosk_manager
-    ctx: KioskContext = kiosk_mgr.context
-
-    # ── Left Column: Live Camera Video ──
-    with v_col:
-        st.markdown("##### 📹 Live Counter Feed")
-        if not st.session_state.camera_running or not st.session_state.camera:
-            st.info("📷 Reception Camera is in Standby. Click **▶ Start Camera Feed** above.")
-        else:
-            camera: Camera = st.session_state.camera
-            pipeline: DetectionPipeline = st.session_state.pipeline
-
-            if st.session_state.face_enc_cache is None:
-                st.session_state.face_enc_cache = get_all_face_encodings()
-
-            frame_rgb = camera.read_frame()
-            if frame_rgb is None:
-                st.warning("⚠️ Waiting for video stream from camera...")
-            else:
-                # Execute pure vision pipeline
-                annotated_frame, det_result = pipeline.process_frame(
-                    frame_rgb=frame_rgb,
-                    face_encodings_cache=st.session_state.face_enc_cache,
-                )
-
-                # Apply Firearm Type Override if selected
-                override_mode = st.session_state.get("weapon_type_override", "")
-                if det_result.weapon_detected and override_mode.startswith("Force: "):
-                    forced_w = override_mode.replace("Force: ", "").strip()
-                    det_result.weapon_type = forced_w
-                    det_result.weapon_category = forced_w
-
-
-                # Update State Machine
-                ctx = kiosk_mgr.update_from_detection(det_result)
-
-                # Display video frame
-                st.image(annotated_frame, channels="RGB", use_container_width=True)
-
-                # If Auto-Checkin is enabled and ready, execute!
-                if st.session_state.auto_checkin and ctx.current_state == KioskState.READY_FOR_CHECKIN:
-                    TransactionManager.start_session(
-                        ctx=ctx,
-                        camera_id=st.session_state.desk_cam_id,
-                        lane_id=st.session_state.desk_lane,
-                        cooldown_cache=st.session_state.cooldown_cache,
-                        cooldown_seconds=int(settings.get("event_cooldown_seconds", 5)),
-                    )
-
-    # ── Right Column: Two-Step Verification Cards ──
-    with s_col:
+# ── Status Card Renderer (Pure Component) ─────────────────────────────────────
+def render_status_card(container, ctx: KioskContext):
+    """Render the status cards inside a persistent Streamlit container."""
+    with container.container():
         st.markdown("##### 🎯 Two-Step Verification Status")
+        st.caption(f"Detection confidence cutoff: {settings.detection_confidence_threshold * 100:.0f}%")
 
-        # ── SECTION 1: PEHLE FACE DETECT (Step 1) ─────────────────────────────
+        # ── Step 1: Face ID Card ──
         st.markdown("###### 🪪 Step 1: Shooter Biometric Recognition")
         if ctx.current_state == KioskState.MULTIPLE_FACES_DETECTED:
-            st.error("⚠️ **MULTIPLE FACES DETECTED**")
-            st.caption("Please ensure only **one shooter** stands in front of counter.")
+            st.error("⚠️ **MULTIPLE FACES DETECTED**\nPlease ensure only **one shooter** stands in front of counter.")
         elif ctx.current_state == KioskState.FACE_NOT_RECOGNIZED:
-            st.warning("👤 **Unrecognized Person**")
-            st.caption("Face detected but not registered. Please add user in Users tab.")
+            st.warning("👤 **Unrecognized Person**\nFace detected but not registered. Please add user in Users tab.")
         elif ctx.face_confirmed and ctx.user_id is not None:
             if ctx.current_state == KioskState.SESSION_ACTIVE:
                 st.warning(f"⚠️ **Shooter Already Inside Range:** **{ctx.user_name}**")
                 st.caption(f"Session #{ctx.active_session_id} | In: {ctx.entry_time} ({ctx.duration_str} ago)")
-                st.info("👉 To check-out this shooter, click 'End Session' in the table below.")
             else:
                 st.success(f"✅ **Step 1 Confirmed:** **{ctx.user_name}** (Match: {pct(ctx.face_confidence)})")
                 st.caption(f"Shooter ID: #{ctx.user_id} | Biometrics Verified")
         else:
-            st.info("⏳ **Searching for shooter at counter...**")
-            st.caption("Please stand facing the camera.")
+            st.info("⏳ **Searching for shooter at counter...**\nPlease stand facing the camera.")
 
         st.markdown("---")
 
-        # ── SECTION 2: THAN WEAPON DETECT (Step 2) ────────────────────────────
+        # ── Step 2: Weapon Verification Card ──
         st.markdown("###### 🔫 Step 2: Weapon Safety Inspection")
         if not ctx.face_confirmed:
             st.markdown(
@@ -351,27 +243,115 @@ def live_feed_and_stages_fragment():
             if ctx.weapon_type is not None:
                 st.success(f"✅ **Step 2 Verified:** **{ctx.weapon_type}** ({pct(ctx.weapon_confidence)})")
                 if ctx.weapon_details:
-                    st.caption(f"Specs: {ctx.weapon_details}")
+                    st.caption(f"Category: {ctx.weapon_category} | {ctx.weapon_details}")
             else:
                 st.warning("⏳ **Action Required: Please present firearm to camera.**")
                 st.caption("Hold weapon in view of camera for safety verification.")
 
-        # Summary State Indicator
+        # Overall Status Banner
         if ctx.current_state == KioskState.READY_FOR_CHECKIN:
             st.success("🟢 **All Steps Verified — Ready for Check-In!**")
-        elif ctx.face_confirmed and ctx.current_state != KioskState.SESSION_ACTIVE:
-            st.info("🟡 **Step 1 Complete** ➔ Waiting for weapon verification")
+        elif ctx.current_state == KioskState.SESSION_COMPLETED and ctx.last_completed_summary:
+            sumry = ctx.last_completed_summary
+            st.success(
+                f"🎉 **CHECK-IN COMPLETE!** Shooter: **{sumry['user_name']}** | Lane: **{sumry['lane_id']}** | "
+                f"Weapon: **{sumry['weapon_type']}**"
+            )
 
 
-# Call the streaming fragment
-live_feed_and_stages_fragment()
+# ── Persistent Video & Status Layout Containers ──────────────────────────────
+feed_col, status_col = st.columns([3, 2])
+
+with feed_col:
+    video_container = st.empty()
+
+with status_col:
+    status_container = st.empty()
+    action_container = st.empty()
+
+
+# ── Action Buttons Container ──────────────────────────────────────────────────
+def render_action_bar(container, ctx: KioskContext):
+    with container.container():
+        if ctx.current_state == KioskState.READY_FOR_CHECKIN:
+            b_col1, b_col2 = st.columns([2, 1])
+            with b_col1:
+                if st.button("▶ Confirm Check-In & Enter", type="primary", use_container_width=True, key="btn_confirm_checkin"):
+                    do_checkin()
+                    st.rerun()
+            with b_col2:
+                if st.button("🔄 Clear", use_container_width=True, key="btn_clear_kiosk"):
+                    do_reset()
+                    st.rerun()
+
+
+# ── Persistent Non-Flickering Video Stream Loop ──────────────────────────────
+if not st.session_state.camera_running or not st.session_state.camera:
+    video_container.info("📷 Reception Camera is in Standby. Click **▶ Start Camera Feed** above.")
+    render_status_card(status_container, st.session_state.kiosk_manager.context)
+else:
+    camera: Camera = st.session_state.camera
+    pipeline: DetectionPipeline = st.session_state.pipeline
+    kiosk_mgr: KioskStateManager = st.session_state.kiosk_manager
+
+    if st.session_state.face_enc_cache is None:
+        st.session_state.face_enc_cache = get_all_face_encodings()
+
+    # Initial frame check
+    frame_rgb = camera.read_frame()
+    if frame_rgb is None:
+        video_container.warning("⚠️ Waiting for video stream from threaded capture driver...")
+        render_status_card(status_container, kiosk_mgr.context)
+    else:
+        # Continuous streaming loop updating persistent placeholders without page remounts
+        # Runs smoothly at target frame rate
+        annotated_frame, det_result = pipeline.process_frame(
+            frame_rgb=frame_rgb,
+            face_encodings_cache=st.session_state.face_enc_cache,
+        )
+        ctx = kiosk_mgr.update_from_detection(det_result)
+        video_container.image(annotated_frame, channels="RGB", width="stretch")
+        render_status_card(status_container, ctx)
+        render_action_bar(action_container, ctx)
+
+        if ctx.current_state == KioskState.READY_FOR_CHECKIN:
+            summary = do_checkin()
+            if summary:
+                st.toast(f"🎯 Range Session Active: {summary['user_name']} ({summary['weapon_type']}) on {st.session_state.desk_lane}!", icon="🔫")
+            st.rerun()
+
+        # Stream smoothly until Streamlit triggers a user interaction
+        # We loop with a tiny sleep to keep frame rendering snappy and flicker-free
+        for _ in range(25):  # Process batch of frames smoothly per script cycle
+            if not st.session_state.camera_running or not camera.is_open:
+                break
+            f_rgb = camera.read_frame()
+            if f_rgb is not None:
+                annotated_f, d_res = pipeline.process_frame(
+                    frame_rgb=f_rgb,
+                    face_encodings_cache=st.session_state.face_enc_cache,
+                )
+                ctx = kiosk_mgr.update_from_detection(d_res)
+                video_container.image(annotated_f, channels="RGB", width="stretch")
+                render_status_card(status_container, ctx)
+                if ctx.current_state == KioskState.READY_FOR_CHECKIN:
+                    summary = do_checkin()
+                    if summary:
+                        st.toast(f"🎯 Range Session Active: {summary['user_name']} ({summary['weapon_type']}) on {st.session_state.desk_lane}!", icon="🔫")
+                    st.rerun()
+            time.sleep(0.035)
+
+        # Trigger automatic smooth rerun to continue live stream if camera still active
+        if st.session_state.camera_running:
+            time.sleep(0.01)
+            st.rerun()
 
 
 # ── MANUAL SESSION END & ACTIVE SHOOTERS PANEL ────────────────────────────────
 st.divider()
 
 st.subheader("🎯 Active Shooters on Range (Manual Check-Out)")
-st.caption("Session end via camera is disabled. Desk operator clicks 'End Session' below to check out shooters.")
+st.caption("Desk operator clicks 'End Session' below to check out shooters in an atomic transaction.")
 
 active_sessions = fetch_all(
     """

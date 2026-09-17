@@ -1,7 +1,6 @@
 import streamlit as st
 
 from database.database import execute, fetch_all, fetch_one, require_db_or_stop
-from utils.helpers import next_weapon_id
 
 st.set_page_config(page_title="Settings", page_icon="⚙️", layout="wide")
 require_db_or_stop()
@@ -66,40 +65,3 @@ with st.expander("Add camera / lane"):
             st.rerun()
         else:
             st.error("Both fields are required.")
-
-st.divider()
-st.subheader("Weapon Inventory")
-st.caption(
-    "Manual inventory list only — not linked to live camera detections "
-    "(the camera reports a weapon type, not a specific inventory item)."
-)
-
-weapons = fetch_all("SELECT * FROM weapons ORDER BY weapon_id")
-for w in weapons:
-    cols = st.columns([2, 2, 2])
-    cols[0].write(w["weapon_id"])
-    cols[1].write(w["weapon_type"])
-    new_status = cols[2].selectbox(
-        "Status", ["Available", "In Use", "Maintenance"],
-        index=["Available", "In Use", "Maintenance"].index(w["status"]),
-        key=f"wstatus_{w['weapon_id']}",
-        label_visibility="collapsed",
-    )
-    if new_status != w["status"]:
-        execute("UPDATE weapons SET status = %s WHERE weapon_id = %s", (new_status, w["weapon_id"]))
-        st.rerun()
-
-with st.expander("Add weapon"):
-    wtype = st.text_input("Weapon type (e.g. Pistol, Rifle)")
-    if st.button("Add Weapon"):
-        if wtype:
-            existing_ids = [w["weapon_id"] for w in weapons]
-            new_id = next_weapon_id(existing_ids)
-            execute(
-                "INSERT INTO weapons (weapon_id, weapon_type, status) VALUES (%s, %s, 'Available')",
-                (new_id, wtype),
-            )
-            st.success(f"Added {new_id}.")
-            st.rerun()
-        else:
-            st.error("Weapon type is required.")

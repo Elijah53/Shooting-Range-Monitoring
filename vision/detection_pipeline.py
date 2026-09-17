@@ -1,13 +1,13 @@
 """
 vision/detection_pipeline.py
 ----------------------------
-Encapsulates all computer vision tasks (Face Recognition + YOLO Weapon Detection + Temporal Smoothing).
+Encapsulates computer vision inference (Face Recognition + Multi-Class YOLO Weapon Detection + Temporal Smoothing).
 
 Responsibilities:
 1. Receives raw camera RGB frames.
-2. Fast face detection with downscaled HOG (0.5x) for high frame rate, followed by full-res encoding.
+2. Fast face detection with downscaled HOG for responsive frame rates, followed by full-res encoding.
 3. Multiple-face rejection and 128-d biometrics matching against registered shooters.
-4. YOLOv8 threat detection & firearm classification.
+4. Pretrained multi-class YOLO threat detection & firearm classification.
 5. Returns an annotated frame along with a pure DetectionResult dataclass.
 NO database transactions are performed here.
 """
@@ -32,9 +32,9 @@ class DetectionPipeline:
         self,
         weapon_detector: Optional[WeaponDetector | MockWeaponDetector] = None,
         face_match_threshold: float = 0.60,
-        weapon_confidence_threshold: float = 0.50,
+        weapon_confidence_threshold: float = 0.45,
         face_interval: int = 4,
-        weapon_interval: int = 2,
+        weapon_interval: int = 1,
         buffer_size: int = 3,
     ) -> None:
         self.detector = weapon_detector or get_weapon_detector()
@@ -74,7 +74,7 @@ class DetectionPipeline:
             if fc % self.face_interval == 1 or fc == 1:
                 try:
                     import face_recognition
-                    # 0.5x downscale makes HOG detection ~4x faster (~22ms)
+                    # 0.5x downscale makes HOG detection ~4x faster (~20ms)
                     small_frame = cv2.resize(frame_rgb, (0, 0), fx=0.5, fy=0.5)
                     face_locs_small = face_recognition.face_locations(small_frame, model="hog")
                     face_count = len(face_locs_small)
@@ -88,7 +88,7 @@ class DetectionPipeline:
                         orig_box = (top_s * 2, right_s * 2, bottom_s * 2, left_s * 2)
                         face_bbox = (left_s * 2, top_s * 2, right_s * 2, bottom_s * 2)
 
-                        # Encode face at full resolution for high biometric accuracy
+                        # Encode face at full resolution for biometric accuracy
                         frame_encs = face_recognition.face_encodings(frame_rgb, [orig_box])
                         if frame_encs:
                             frame_enc = frame_encs[0]
@@ -119,8 +119,8 @@ class DetectionPipeline:
         else:
             self._last_face_obs = (False, False, 0, None, None, 0.0, None)
 
-        # ── 2. Weapon Detection Step ──────────────────────────────────────────
-        if fc % self.weapon_interval == 1 or fc == 1:
+        # ── 2. Pretrained Multi-Class Weapon Detection Step ───────────────────
+        if fc % self.weapon_interval == 0 or fc == 1:
             try:
                 detections = self.detector.detect_weapon(frame_rgb)
                 best_det = None
@@ -154,7 +154,7 @@ class DetectionPipeline:
                 else:
                     uid, uname, f_conf = None, None, 0.0
 
-        # Stabilize weapon result
+        # Stabilize weapon result (requires at least 2 consistent frames out of buffer)
         weapon_detected = False
         wpn_type, wpn_cat, wpn_conf, wpn_bbox, wpn_details = None, None, 0.0, None, None
         valid_weapons = [w for w in self._weapon_history if w is not None]
@@ -165,14 +165,7 @@ class DetectionPipeline:
             wpn_cat = getattr(best_recent, "category", "Firearm")
             wpn_conf = best_recent.confidence
             wpn_bbox = best_recent.bbox
-            wpn_details = getattr(best_recent, "details", None)
-        elif self._last_weapon_obs is not None:
-            weapon_detected = True
-            wpn_type = self._last_weapon_obs.weapon_type
-            wpn_cat = getattr(self._last_weapon_obs, "category", "Firearm")
-            wpn_conf = self._last_weapon_obs.confidence
-            wpn_bbox = self._last_weapon_obs.bbox
-            wpn_details = getattr(self._last_weapon_obs, "details", None)
+            wpn_details = getattr(best_recent, "details", "")
 
         # ── 4. Build Pure DetectionResult ─────────────────────────────────────
         result = DetectionResult(

@@ -1,25 +1,10 @@
 """
 database/database.py
 --------------------
-All DB connectivity for the application.
+All DB connectivity and transaction management for the application.
 
-Performance note
-----------------
-A ConnectionPool is created once per Streamlit server process and cached
-via @st.cache_resource. If psycopg_pool is not installed, a resilient
-connection manager fallback is provided so the application never crashes.
-
-Public API
-----------
-DatabaseUnavailableError  → Exception
-check_connection()        → bool
-require_db_or_stop()      → None (shows UI error and halts page if DB is down)
-get_connection()          → psycopg.Connection (context-managed borrow)
-init_db()                 → None (runs schema.sql, idempotent)
-execute(sql, params)      → None
-fetch_one(sql, params)    → dict | None
-fetch_all(sql, params)    → list[dict]
-fetch_scalar(sql, params) → Any
+Supports connection pooling via psycopg_pool with fallback, context-managed
+atomic transactions, and query helpers.
 """
 
 from __future__ import annotations
@@ -86,7 +71,6 @@ def get_pool():
         )
         return pool
     except Exception:
-        # Fall back gracefully if pool cannot open immediately
         return None
 
 
@@ -110,6 +94,18 @@ def get_connection() -> Generator[psycopg.Connection, None, None]:
             yield conn
         finally:
             conn.close()
+
+
+@contextmanager
+def transaction() -> Generator[psycopg.Connection, None, None]:
+    """
+    Provide an atomic database transaction context.
+    Commits automatically on successful completion; rolls back all operations
+    if an exception is raised within the block.
+    """
+    with get_connection() as conn:
+        with conn.transaction():
+            yield conn
 
 
 # ── Diagnostics & Safety Checks ───────────────────────────────────────────────
@@ -162,37 +158,61 @@ def init_db() -> None:
 
 # ── Query helpers ─────────────────────────────────────────────────────────────
 
-def execute(sql: str, params: tuple | dict | None = None) -> None:
+def execute(
+    sql: str,
+    params: tuple | dict | None = None,
+    conn: Optional[psycopg.Connection] = None,
+) -> None:
     """Execute a write statement (INSERT / UPDATE / DELETE)."""
-    with get_connection() as conn:
+    if conn is not None:
         with conn.cursor() as cur:
             cur.execute(sql, params)
-        conn.commit()
+    else:
+        with get_connection() as c:
+            with c.cursor() as cur:
+                cur.execute(sql, params)
+            c.commit()
 
 
 def fetch_one(
-    sql: str, params: tuple | dict | None = None
+    sql: str,
+    params: tuple | dict | None = None,
+    conn: Optional[psycopg.Connection] = None,
 ) -> Optional[dict]:
     """Return the first matching row as a dict, or None."""
-    with get_connection() as conn:
+    if conn is not None:
         with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchone()
+    with get_connection() as c:
+        with c.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchone()
 
 
 def fetch_all(
-    sql: str, params: tuple | dict | None = None
+    sql: str,
+    params: tuple | dict | None = None,
+    conn: Optional[psycopg.Connection] = None,
 ) -> list[dict]:
     """Return all matching rows as a list of dicts."""
-    with get_connection() as conn:
+    if conn is not None:
         with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+    with get_connection() as c:
+        with c.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
 
 
-def fetch_scalar(sql: str, params: tuple | dict | None = None) -> Any:
+def fetch_scalar(
+    sql: str,
+    params: tuple | dict | None = None,
+    conn: Optional[psycopg.Connection] = None,
+) -> Any:
     """Return the first column of the first row (for COUNT(*), etc.)."""
-    row = fetch_one(sql, params)
+    row = fetch_one(sql, params, conn=conn)
     if row is None:
         return None
     return next(iter(row.values()))

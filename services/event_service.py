@@ -1,18 +1,8 @@
 """
 services/event_service.py
 --------------------------
-Weapon event logging AND the detection/validation orchestration described
-in §8 of the specification.
-
-Two responsibilities kept in one file (as allowed by the spec):
-  1. log_weapon_event()       — insert a weapon_event row with cooldown check.
-  2. process_frame()          — the per-frame validation workflow that decides
-                                 what to do with (face_result, weapon_result).
-  3. get_events(filters)      — query helper for the Weapon Events page.
-  4. count_events_today()     — for the Dashboard metric card.
-
-Cooldown state is passed in as a dict from st.session_state so this module
-stays free of Streamlit imports and is unit-testable.
+Weapon event logging and detection/validation orchestration.
+All database writes execute within atomic transactions.
 """
 
 from __future__ import annotations
@@ -22,9 +12,8 @@ from datetime import date, datetime
 from typing import Optional
 
 import streamlit as st
-from database.database import execute, fetch_all, fetch_one, fetch_scalar
+from database.database import execute, fetch_all, fetch_one, fetch_scalar, transaction
 from models.event import WeaponEvent
-from services import attendance_service, session_service
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -41,21 +30,13 @@ def log_weapon_event(
 ) -> Optional[int]:
     """
     Insert a weapon_event row only if outside the cooldown window.
-
-    Parameters
-    ----------
-    cooldown_cache  : mutable dict held in st.session_state.
-    cooldown_seconds: configurable cooldown from settings.
-
-    Returns
-    -------
-    The new event_id, or None if suppressed by cooldown.
     """
     cache_key = (user_id, weapon_type)
     last_logged = cooldown_cache.get(cache_key)
+    now_dt = datetime.now()
 
     if last_logged is not None:
-        elapsed = (datetime.now() - last_logged).total_seconds()
+        elapsed = (now_dt - last_logged).total_seconds()
         if elapsed < cooldown_seconds:
             return None  # within cooldown window — suppress duplicate
 
@@ -69,34 +50,40 @@ def log_weapon_event(
         (session_id, user_id, weapon_type, round(confidence, 4), camera_id, lane_id),
     )
     if row:
-        cooldown_cache[cache_key] = datetime.now()
+        cooldown_cache[cache_key] = now_dt
         return row["event_id"]
     return None
 
 
-# ── Detection / validation workflow (§8) ─────────────────────────────────────
+def set_manual_weapon_type(event_id: int, weapon_type: str, verified_by: str) -> None:
+    """Record a manual human override/verification for a weapon event."""
+    execute(
+        "UPDATE weapon_events SET manual_weapon_type = %s, "
+        "manually_verified_by = %s, manually_verified_at = NOW() "
+        "WHERE event_id = %s",
+        (weapon_type, verified_by, event_id),
+    )
+
+
+# ── Detection / validation workflow ──────────────────────────────────────────
 
 @dataclass
 class FrameResult:
     """Summary returned after processing one frame."""
-    # Face outcome
     user_id: Optional[int] = None
     user_name: Optional[str] = None
     face_confidence: float = 0.0
     face_recognized: bool = False
 
-    # Weapon outcome
     weapon_detected: bool = False
     weapon_type: Optional[str] = None
     weapon_confidence: float = 0.0
     weapon_bbox: Optional[tuple] = None
 
-    # DB actions taken this frame
     attendance_id: Optional[int] = None
     session_id: Optional[int] = None
     event_id: Optional[int] = None
 
-    # Human-readable status for the sidebar
     status_message: str = "No user / weapon detected"
 
 
@@ -110,23 +97,12 @@ def process_frame(
     confidence_threshold: float,
 ) -> FrameResult:
     """
-    Apply the §8 validation table to one frame's detection results and
-    create DB rows as needed.
-
-    Parameters
-    ----------
-    face_result       : output of vision.face_recognition.recognize_face()
-    weapon_detections : output of WeaponDetector.detect_weapon()
-    lane_id           : lane associated with the active camera
-    camera_id         : camera_id string (or None)
-    cooldown_cache    : mutable dict from st.session_state for cooldown tracking
-    cooldown_seconds  : from settings
-    confidence_threshold: minimum weapon confidence to act on
+    Apply validation rules to one frame's detection results and create DB rows
+    inside an atomic transaction.
     """
     uid, uname, face_conf = face_result
     face_recognized = uid is not None
 
-    # Pick the highest-confidence detection above threshold
     best_detection = None
     for det in weapon_detections:
         if det.confidence >= confidence_threshold:
@@ -147,23 +123,69 @@ def process_frame(
         res.weapon_confidence = best_detection.confidence
         res.weapon_bbox = best_detection.bbox
 
-    # ── §8 decision table ────────────────────────────────────────────────────
-
     if face_recognized and weapon_detected:
-        # Row 1: Recognized + Detected → attendance, session, event
-        att_id = attendance_service.create_attendance(uid)
-        sess_id = session_service.start_session(uid, lane_id)
+        today = date.today()
+        now_dt = datetime.now()
+        cache_key = (uid, best_detection.weapon_type)
 
-        evt_id = log_weapon_event(
-            user_id=uid,
-            session_id=sess_id,
-            weapon_type=best_detection.weapon_type,
-            confidence=best_detection.confidence,
-            camera_id=camera_id,
-            lane_id=lane_id,
-            cooldown_cache=cooldown_cache,
-            cooldown_seconds=cooldown_seconds,
-        )
+        with transaction() as conn:
+            # 1. Attendance
+            att_row = fetch_one(
+                "SELECT attendance_id FROM attendance WHERE user_id = %s AND status = 'Active' AND entry_time::date = %s LIMIT 1",
+                (uid, today),
+                conn=conn,
+            )
+            if att_row:
+                att_id = att_row["attendance_id"]
+            else:
+                new_att = fetch_one(
+                    "INSERT INTO attendance (user_id, status) VALUES (%s, 'Active') RETURNING attendance_id",
+                    (uid,),
+                    conn=conn,
+                )
+                att_id = new_att["attendance_id"] if new_att else None
+
+            # 2. Session
+            sess_row = fetch_one(
+                "SELECT session_id FROM sessions WHERE user_id = %s AND status = 'Active' LIMIT 1",
+                (uid,),
+                conn=conn,
+            )
+            if sess_row:
+                sess_id = sess_row["session_id"]
+            else:
+                new_sess = fetch_one(
+                    "INSERT INTO sessions (user_id, lane_id, status) VALUES (%s, %s, 'Active') RETURNING session_id",
+                    (uid, lane_id),
+                    conn=conn,
+                )
+                sess_id = new_sess["session_id"] if new_sess else None
+
+            # 3. Weapon event
+            last_logged = cooldown_cache.get(cache_key)
+            cooldown_ok = True
+            if last_logged is not None:
+                elapsed = (now_dt - last_logged).total_seconds()
+                if elapsed < cooldown_seconds:
+                    cooldown_ok = False
+
+            evt_id = None
+            if cooldown_ok:
+                new_evt = fetch_one(
+                    """
+                    INSERT INTO weapon_events
+                        (session_id, user_id, weapon_type, confidence, camera_id, lane_id)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING event_id
+                    """,
+                    (sess_id, uid, best_detection.weapon_type, round(best_detection.confidence, 4), camera_id, lane_id),
+                    conn=conn,
+                )
+                evt_id = new_evt["event_id"] if new_evt else None
+
+        if cooldown_ok and evt_id is not None:
+            cooldown_cache[cache_key] = now_dt
+
         res.attendance_id = att_id
         res.session_id = sess_id
         res.event_id = evt_id
@@ -173,18 +195,15 @@ def process_frame(
         )
 
     elif face_recognized and not weapon_detected:
-        # Row 2: Recognized + No weapon → show message only
         res.status_message = f"Face recognized: {uname} | Weapon: Not detected"
 
     elif not face_recognized and weapon_detected:
-        # Row 3: Unknown user + Weapon → alert only, no DB writes tied to any user
         res.status_message = (
             f"Weapon detected: {best_detection.weapon_type} "
             f"({best_detection.confidence:.0%} confidence) — User not identified"
         )
 
     else:
-        # Row 4: Nothing
         res.status_message = "No user / weapon detected"
 
     return res
@@ -209,8 +228,6 @@ def get_events(
     if user_id is not None:
         clauses.append("e.user_id = %s")
         params.append(user_id)
-    from_date = from_date or date_from
-    to_date = to_date or date_to
     if from_date is not None:
         clauses.append("e.detected_at::date >= %s")
         params.append(from_date)

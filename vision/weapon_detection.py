@@ -1,29 +1,16 @@
 """
 vision/weapon_detection.py
 ---------------------------
-Weapon detection and specific firearm model classification.
+Pretrained multi-class YOLO weapon detection.
 
-Pipeline:
-1. YOLOv8 locates the firearm bounding box.
-2. The fine-grained firearm model classifier inspects the cropped region:
-   - Geometry & aspect ratio
-   - Slide vs cylinder profile (Pistol vs Revolver)
-   - Barrel length & receiver structure (Carbine / Rifle / Shotgun / Sniper)
-   - Stock & magazine contours (AR-15 vs AK-47)
-3. Outputs specific model labels:
-   - Glock 17 (Pistol)
-   - Beretta 92FS (Pistol)
-   - Colt Python (Revolver)
-   - AR-15 / M4 (Assault Rifle)
-   - AK-47 (Assault Rifle)
-   - Remington 870 (Shotgun)
-   - Barrett M82 (Sniper Rifle)
+Supports multi-class checkpoints (e.g. Rifle vs Pistol vs Heavy Weapon vs Knife)
+and maps model outputs directly to firearm categories.
 """
 
 from __future__ import annotations
 
 import os
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, List
 import cv2
 import numpy as np
 
@@ -40,141 +27,139 @@ class Detection(NamedTuple):
     details: str = ""
 
 
-# ── Fine-grained Firearm Model Classifier ─────────────────────────────────────
+# ── Standard Weapon Name Normalization ─────────────────────────────────────────
 
-def classify_firearm_model(crop: np.ndarray, base_label: str = "Gun") -> tuple[str, str, str]:
+STANDARD_WEAPON_MAP = {
+    "rifle": ("Rifle", "Firearm", "Tactical / Long Barrel Rifle"),
+    "assault_rifle": ("Rifle", "Firearm", "Tactical Assault Rifle"),
+    "heavy_weapon": ("Rifle", "Firearm", "Tactical Long Firearm"),
+    "shotgun": ("Shotgun", "Firearm", "Pump-Action / Tactical Shotgun"),
+    "pistol": ("Pistol", "Firearm", "Handgun / Sidearm"),
+    "handgun": ("Pistol", "Firearm", "Handgun / Sidearm"),
+    "revolver": ("Revolver", "Firearm", "Revolver Cylinder Handgun"),
+    "gun": ("Pistol", "Firearm", "Firearm / Handgun"),
+}
+
+NON_WEAPON_CLASSES = {"person", "human", "face", "background", "hand", "cell_phone", "phone", "knife", "blade", "grenade", "explosion"}
+
+
+def normalize_weapon_label(class_name: str, class_id: int, bbox: tuple[int, int, int, int]) -> tuple[Optional[str], str, str]:
     """
-    Classify detection into the exact firearm model name:
-    - Glock 17 (9x19mm Parabellum)
-    - Beretta 92FS (9mm Service Pistol)
-    - Colt M1911 (.45 ACP Classic)
-    - Sig Sauer P320 (9mm Modular Handgun)
-    - Colt Python (.357 Magnum Revolver)
-    - AR-15 / M4 (5.56mm Tactical Carbine)
-    - AK-47 (7.62x39mm Assault Rifle)
-    - Remington 870 (12-Gauge Tactical Shotgun)
-    
-    Returns:
-        (exact_gun_name, category, details)
-        e.g. ("Glock 17", "Handgun", "9x19mm Safe-Action Semi-Automatic")
+    Map the predicted class label/index directly from the YOLO model output.
+    Returns (None, '', '') if the detected class is non-firearm or unrecognized noise.
     """
-    if crop is None or crop.size == 0:
-        return "Glock 17", "Handgun", "9x19mm Safe-Action Semi-Automatic"
+    name_clean = str(class_name).strip().lower().replace("-", "_").replace(" ", "_")
 
-    h, w = crop.shape[:2]
-    long_dim = max(w, h)
-    short_dim = max(min(w, h), 1)
-    aspect_ratio = long_dim / float(short_dim)
+    # Reject non-firearm classes explicitly
+    if name_clean in NON_WEAPON_CLASSES:
+        return None, "", ""
 
-    # Convert to grayscale and HSV for texture, geometry and material analysis
-    if len(crop.shape) == 3:
-        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-        hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
-    else:
-        gray = crop
-        hsv = None
+    # 1. Direct match for explicit firearm classes
+    for key, (w_type, cat, desc) in STANDARD_WEAPON_MAP.items():
+        if key in name_clean:
+            # If explicit rifle or shotgun or revolver, return immediately
+            if key in ("rifle", "assault_rifle", "heavy_weapon", "shotgun", "revolver"):
+                return w_type, cat, desc
 
-    # 1. Long Firearms (Rifles, Shotguns) - aspect_ratio >= 2.25
-    if aspect_ratio >= 2.25:
-        is_wood = False
-        if hsv is not None:
-            wood_mask = cv2.inRange(hsv, (8, 45, 40), (28, 255, 210))
-            wood_ratio = np.count_nonzero(wood_mask) / float(max(crop.shape[0] * crop.shape[1], 1))
-            is_wood = wood_ratio > 0.06
+    # 2. Generic weapon/gun terms -> check geometry
+    if any(term in name_clean for term in ("gun", "weapon", "firearm", "pistol", "handgun")):
+        x1, y1, x2, y2 = bbox
+        box_w = max(1, x2 - x1)
+        box_h = max(1, y2 - y1)
+        aspect_ratio = max(box_w, box_h) / float(min(box_w, box_h))
 
-        if is_wood:
-            return "AK-47", "Rifle", "7.62x39mm Gas-Operated Assault Rifle"
-        elif aspect_ratio >= 3.2:
-            return "Remington 870", "Shotgun", "12-Gauge Tactical Pump-Action Shotgun"
-        else:
-            return "AR-15 / M4", "Rifle", "5.56x45mm NATO Tactical Carbine"
+        # Long firearms (rifles, carbines, shotguns) have aspect ratio >= 2.0
+        if aspect_ratio >= 2.0:
+            return "Rifle", "Firearm", "Tactical Rifle / Long Gun"
+        return "Pistol", "Firearm", "Handgun / Sidearm"
 
-    # 2. Revolvers - aspect_ratio <= 1.25 (Cylinder profile)
-    elif aspect_ratio <= 1.25:
-        return "Colt Python", "Revolver", ".357 Magnum 6-Round Cylinder"
-
-    # 3. Semi-Automatic Handguns (aspect_ratio between 1.25 and 2.25)
-    else:
-        top_slice = gray[:int(h * 0.35), :]
-        top_var = float(np.var(top_slice)) if top_slice.size > 0 else 0.0
-        slide_mean = float(np.mean(top_slice)) if top_slice.size > 0 else 0.0
-
-        if top_var > 2200.0:
-            return "Beretta 92FS", "Handgun", "9x19mm Open-Slide Service Pistol"
-        elif slide_mean > 140.0:
-            return "Colt M1911", "Handgun", ".45 ACP Classic Stainless Steel"
-        elif top_var > 1350.0:
-            return "Sig Sauer P320", "Handgun", "9mm Nitron Modular Handgun"
-        else:
-            return "Glock 17", "Handgun", "9x19mm Safe-Action Semi-Automatic"
+    # If it has no firearm-related keyword, do not treat as a weapon
+    return None, "", ""
 
 
 # ── Real detector ──────────────────────────────────────────────────────────────
 
 class WeaponDetector:
-    """YOLOv8 Gun & Firearm Detector."""
+    """Pretrained YOLO Firearm Weapon Detector."""
 
     def __init__(self, model_path: str, confidence_threshold: float) -> None:
         self._model_path = model_path
         self._confidence_threshold = confidence_threshold
         self._model = None
-        self._gun_class_ids: list[int] = []
+        self._weapon_class_ids: list[int] = []
 
     def load_model(self) -> None:
         from ultralytics import YOLO
         self._model = YOLO(self._model_path)
-        # Automatically identify firearm / gun classes only
-        self._gun_class_ids = []
-        for cid, cname in self._model.names.items():
-            name_lower = str(cname).lower()
-            if any(term in name_lower for term in ["gun", "pistol", "rifle", "firearm", "weapon"]):
-                self._gun_class_ids.append(cid)
+        
+        # Identify firearm-related class IDs from model metadata if present
+        self._weapon_class_ids = []
+        if hasattr(self._model, "names") and self._model.names:
+            for cid, cname in self._model.names.items():
+                name_lower = str(cname).lower()
+                if any(term in name_lower for term in ["gun", "pistol", "rifle", "shotgun", "firearm", "weapon", "handgun", "heavy"]):
+                    if not any(nw in name_lower for nw in ["person", "human", "face", "knife", "blade", "grenade"]):
+                        self._weapon_class_ids.append(cid)
 
     def detect_weapon(self, frame: np.ndarray) -> list[Detection]:
         """
         Run inference on *frame* (RGB ndarray).
-        Strictly returns gun/firearm detections (Pistol or Rifle).
+        Directly extracts weapon category and confidence from YOLO model predictions.
         """
         if self._model is None:
             return []
 
-        # Only pass gun class IDs to YOLO inference to ignore all other objects
+        h_frame, w_frame = frame.shape[:2]
+        min_dim = min(h_frame, w_frame)
+        min_box_size = max(28, int(min_dim * 0.05))  # Minimum dimension to discard tiny false-positive noise
+        min_area = int(0.003 * h_frame * w_frame)    # Minimum 0.3% of screen area
+
         results = self._model(
             frame,
-            classes=self._gun_class_ids if self._gun_class_ids else None,
+            conf=max(0.20, self._confidence_threshold),
+            iou=0.45,
+            classes=self._weapon_class_ids if self._weapon_class_ids else None,
             verbose=False,
         )
         detections: list[Detection] = []
-        h_frame, w_frame = frame.shape[:2]
 
         for result in results:
+            if not result.boxes:
+                continue
             for box in result.boxes:
                 conf = float(box.conf[0])
                 if conf < self._confidence_threshold:
                     continue
                 cls_id = int(box.cls[0])
-                if self._gun_class_ids and cls_id not in self._gun_class_ids:
+                if self._weapon_class_ids and cls_id not in self._weapon_class_ids:
                     continue
 
-                base_label = (
+                raw_label = (
                     result.names[cls_id]
                     if result.names and cls_id in result.names
-                    else "Gun"
+                    else f"Class_{cls_id}"
                 )
 
-                # Get coordinates
+                # Bounding box coordinates clamped to frame
                 x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-                # Clamp coordinates to frame bounds
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w_frame, x2), min(h_frame, y2)
+                bw, bh = x2 - x1, y2 - y1
 
-                # Crop weapon region to determine firearm type (Pistol vs Rifle)
-                crop = frame[y1:y2, x1:x2]
-                specific_model, category, details = classify_firearm_model(crop, base_label)
+                # Discard noise detections with unrealistic dimensions
+                if bw < min_box_size and bh < min_box_size:
+                    continue
+                if (bw * bh) < min_area:
+                    continue
+
+                # Map to standardized firearm name and category
+                weapon_type, category, details = normalize_weapon_label(raw_label, cls_id, (x1, y1, x2, y2))
+                if weapon_type is None:
+                    continue
 
                 detections.append(
                     Detection(
-                        weapon_type=specific_model,
+                        weapon_type=weapon_type,
                         confidence=conf,
                         bbox=(x1, y1, x2, y2),
                         category=category,
@@ -187,9 +172,7 @@ class WeaponDetector:
 # ── Mock detector ──────────────────────────────────────────────────────────────
 
 class MockWeaponDetector:
-    """
-    Fallback detector used when no model file is configured.
-    """
+    """Fallback detector used when no model file is configured."""
     MOCK_MODE = True
 
     def load_model(self) -> None:
@@ -210,6 +193,10 @@ def get_weapon_detector(
     MockWeaponDetector. Calls load_model() before returning.
     """
     path = model_path or config.WEAPON_MODEL_PATH
+    # Default to multi_weapon_model.pt if exists
+    if not os.path.isfile(path) and os.path.isfile("model_data/multi_weapon_model.pt"):
+        path = "model_data/multi_weapon_model.pt"
+
     threshold = (
         confidence_threshold
         if confidence_threshold is not None

@@ -1,31 +1,22 @@
 """
 vision/face_recognition.py
 ---------------------------
-All face-recognition logic is isolated here so the underlying library can
-be swapped without touching any other file.
+Biometric face encoding and recognition.
 
-Library: `face_recognition` (dlib-based, pretrained — no training required).
-
-If the library is not installed, the module degrades gracefully:
-- `FACE_RECOGNITION_AVAILABLE` is set to False.
-- A human-readable install hint is stored in `INSTALL_HINT`.
-- All public functions raise `FaceRecognitionUnavailableError` instead of
-  crashing the whole application.
+Biometric vectors (128-d floats) are saved and loaded as raw binary bytes
+(IEEE 754 float64 array buffers) directly using NumPy into PostgreSQL's BYTEA
+column, eliminating Python pickle dependencies and security risks.
 """
 
 from __future__ import annotations
 
 import io
-import pickle
 import sys
 from typing import Optional
 
 import numpy as np
 
 # ── Graceful import ────────────────────────────────────────────────────────────
-# face_recognition's own __init__.py prints a "pip install" reminder to stdout
-# at import time even when the package IS installed correctly.  We suppress that
-# noise so it doesn't appear in Streamlit's output.
 try:
     import contextlib as _cl
     with _cl.redirect_stdout(io.StringIO()):
@@ -67,11 +58,9 @@ except (ImportError, Exception, SystemExit):
             "```"
         )
 
-
-
-# ── Backward-compat aliases (used by pages/3_Users.py) ────────────────────────
 FACE_LIB_AVAILABLE = FACE_RECOGNITION_AVAILABLE
-IMPORT_ERROR = INSTALL_HINT  # human-readable install instructions if unavailable
+IMPORT_ERROR = INSTALL_HINT
+
 
 # ── Custom exceptions ──────────────────────────────────────────────────────────
 
@@ -87,16 +76,42 @@ class MultipleFacesDetectedError(Exception):
     """Raised when more than one face is found during registration."""
 
 
-# ── Encoding serialisation ─────────────────────────────────────────────────────
+# ── Raw Binary Face Vector Serialization (NumPy) ──────────────────────────────
 
 def serialize_encoding(encoding: np.ndarray) -> bytes:
-    """Pickle a numpy encoding array for storage in a BYTEA column."""
-    return pickle.dumps(encoding)
+    """
+    Convert a 128-dimensional face encoding vector into raw binary bytes (float64).
+    Stored directly into PostgreSQL BYTEA without pickle.
+    """
+    arr = np.asarray(encoding, dtype=np.float64)
+    return arr.tobytes()
 
 
-def deserialize_encoding(data: bytes) -> np.ndarray:
-    """Unpickle a BYTEA value back to a numpy array."""
-    return pickle.loads(data)
+def deserialize_encoding(data: bytes | memoryview) -> np.ndarray:
+    """
+    Decode raw binary bytes directly into a 128-dimensional NumPy float64 array.
+    Includes backward-compatible fallback for legacy pickled encodings.
+    """
+    if data is None:
+        return np.empty((0,), dtype=np.float64)
+
+    raw_bytes = bytes(data) if isinstance(data, memoryview) else data
+    if len(raw_bytes) == 0:
+        return np.empty((0,), dtype=np.float64)
+
+    # 128 float64 = 1024 bytes; 128 float32 = 512 bytes
+    if len(raw_bytes) == 1024:
+        return np.frombuffer(raw_bytes, dtype=np.float64).copy()
+    elif len(raw_bytes) == 512:
+        return np.frombuffer(raw_bytes, dtype=np.float32).astype(np.float64).copy()
+
+    # Legacy fallback for historical pickled records
+    try:
+        import pickle
+        unpickled = pickle.loads(raw_bytes)
+        return np.asarray(unpickled, dtype=np.float64)
+    except Exception:
+        return np.frombuffer(raw_bytes, dtype=np.float64).copy()
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -104,13 +119,7 @@ def deserialize_encoding(data: bytes) -> np.ndarray:
 def register_face(image: np.ndarray) -> np.ndarray:
     """
     Detect exactly one face in *image* (RGB ndarray) and return its
-    128-dimensional encoding.
-
-    Raises
-    ------
-    FaceRecognitionUnavailableError  — library not installed
-    NoFaceDetectedError              — zero faces found
-    MultipleFacesDetectedError       — more than one face found
+    128-dimensional encoding vector.
     """
     if not FACE_RECOGNITION_AVAILABLE:
         raise FaceRecognitionUnavailableError(INSTALL_HINT)
@@ -135,17 +144,7 @@ def recognize_face(
 ) -> tuple[Optional[int], Optional[str], float]:
     """
     Compare all faces in *frame* against *known_encodings*.
-
-    Parameters
-    ----------
-    frame           : RGB ndarray from the camera.
-    known_encodings : {user_id: (name, encoding_array)}
-    threshold       : Maximum face distance to count as a match (lower = stricter).
-
-    Returns
-    -------
-    (user_id, name, confidence) where confidence is 1 - distance.
-    Returns (None, None, 0.0) if no match or no face found.
+    Returns (user_id, name, confidence).
     """
     if not FACE_RECOGNITION_AVAILABLE:
         raise FaceRecognitionUnavailableError(INSTALL_HINT)
@@ -161,7 +160,6 @@ def recognize_face(
     if not frame_encodings:
         return None, None, 0.0
 
-    # Use the first (most prominent) face in the frame.
     frame_enc = frame_encodings[0]
 
     user_ids = list(known_encodings.keys())

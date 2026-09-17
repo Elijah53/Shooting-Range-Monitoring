@@ -5,12 +5,12 @@ Implements the Kiosk State Manager and Transaction Manager for Front Desk Recept
 
 Architecture:
 - KioskStateManager: Translates vision DetectionResult observations into
-  the two-step verification workflow:
-    Step 1: Face Identification (Pehle Face Detect)
-    Step 2: Weapon Verification (Than Weapon Detect)
+  the sequential two-step verification workflow:
+    Step 1: Face Identification
+    Step 2: Weapon Verification
   Session end is handled MANUALLY from the Active Shooters desk panel.
-- TransactionManager: Coordinates explicit database transactions (Attendance,
-  Sessions, Weapon Events).
+- TransactionManager: Coordinates atomic database transactions for check-in
+  (Attendance, Session, Weapon Events) and check-out to guarantee synchronization.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from typing import Optional, Dict, Any
 
 from models.detection_result import DetectionResult
 from models.kiosk_state import KioskState, TransactionType, KioskContext
-from services import attendance_service, session_service, event_service
+from database.database import transaction, fetch_one, execute
 from utils.helpers import duration_str
 
 
@@ -36,14 +36,12 @@ class KioskStateManager:
     def update_from_detection(
         self,
         det: DetectionResult,
-        force_mode: str = "Auto (Smart Detect)",
     ) -> KioskContext:
         """
         Evaluate new detection result and update the two-step verification state.
         Enforces sequential flow:
           Step 1 -> Face Confirmed (user identity locked-in)
           Step 2 -> Weapon Verified (only runs after Step 1)
-        Does NOT perform any automatic session end via camera.
         """
         # If in completed transaction splash, keep state for a brief display
         if self.context.current_state == KioskState.SESSION_COMPLETED:
@@ -89,6 +87,7 @@ class KioskStateManager:
                     self.weapon_stability_count = 0
 
                     # Check if user already has an open attendance / session
+                    from services import attendance_service, session_service
                     active_att = attendance_service.get_active_attendance(uid)
                     active_sess = session_service.get_active_session(uid)
                     if active_att or active_sess:
@@ -112,17 +111,21 @@ class KioskStateManager:
 
         # ── STEP 2: WEAPON VERIFICATION (only after Step 1 face confirmation) ──
         if self.context.face_confirmed and self.context.user_id is not None:
-            if det.weapon_detected and det.weapon_confidence >= 0.45:
+            if det.weapon_detected and det.weapon_confidence >= 0.50:
                 self.weapon_stability_count += 1
-                self.context.weapon_type = det.weapon_type or "Firearm"
-                self.context.weapon_category = det.weapon_category or "Firearm"
-                self.context.weapon_confidence = det.weapon_confidence
-                self.context.weapon_details = det.weapon_details
-
-                if self.weapon_stability_count >= 1:
+                if self.weapon_stability_count >= 3:
+                    self.context.weapon_type = det.weapon_type or "Firearm"
+                    self.context.weapon_category = det.weapon_category or "Firearm"
+                    self.context.weapon_confidence = det.weapon_confidence
+                    self.context.weapon_details = det.weapon_details
                     self.context.current_state = KioskState.READY_FOR_CHECKIN
             else:
-                if self.context.weapon_type is None:
+                self.weapon_stability_count = max(0, self.weapon_stability_count - 1)
+                if self.weapon_stability_count == 0:
+                    self.context.weapon_type = None
+                    self.context.weapon_category = None
+                    self.context.weapon_confidence = 0.0
+                    self.context.weapon_details = None
                     self.context.current_state = KioskState.USER_IDENTIFIED
 
         self.context.state_timestamp = time.time()
@@ -130,7 +133,7 @@ class KioskStateManager:
 
 
 class TransactionManager:
-    """Handles explicit business transactions against PostgreSQL."""
+    """Coordinates atomic database transactions for front desk check-in / check-out."""
 
     @staticmethod
     def start_session(
@@ -141,7 +144,9 @@ class TransactionManager:
         cooldown_seconds: int = 5,
     ) -> Dict[str, Any]:
         """
-        Execute Check-In: Creates Attendance entry, starts Session, and logs Weapon Event.
+        Execute Atomic Check-In:
+        Wraps attendance record, range session, and weapon event creation in a single
+        atomic database transaction. If any step fails, all changes are rolled back.
         """
         if not ctx.user_id:
             raise ValueError("Cannot start session: No user identified.")
@@ -149,26 +154,90 @@ class TransactionManager:
         uid = ctx.user_id
         weapon_name = ctx.weapon_type or "Firearm"
         weapon_conf = ctx.weapon_confidence or 0.85
+        today = date.today()
+        now_dt = datetime.now()
+        cache_key = (uid, weapon_name)
 
-        # 1. Create or fetch Attendance Record
-        att_id = attendance_service.create_attendance(uid)
+        with transaction() as conn:
+            # 1. Create or fetch Active Attendance Record
+            att_row = fetch_one(
+                """
+                SELECT attendance_id, entry_time FROM attendance
+                WHERE user_id = %s AND status = 'Active' AND entry_time::date = %s
+                ORDER BY entry_time DESC LIMIT 1
+                """,
+                (uid, today),
+                conn=conn,
+            )
+            if att_row:
+                att_id = att_row["attendance_id"]
+            else:
+                new_att = fetch_one(
+                    """
+                    INSERT INTO attendance (user_id, status)
+                    VALUES (%s, 'Active')
+                    RETURNING attendance_id
+                    """,
+                    (uid,),
+                    conn=conn,
+                )
+                if not new_att:
+                    raise RuntimeError("Failed to create attendance row.")
+                att_id = new_att["attendance_id"]
 
-        # 2. Start Range Session
-        sess_id = session_service.start_session(uid, lane_id)
+            # 2. Start Range Session (or reuse existing open session)
+            sess_row = fetch_one(
+                """
+                SELECT session_id FROM sessions
+                WHERE user_id = %s AND status = 'Active'
+                ORDER BY start_time DESC LIMIT 1
+                """,
+                (uid,),
+                conn=conn,
+            )
+            if sess_row:
+                sess_id = sess_row["session_id"]
+            else:
+                new_sess = fetch_one(
+                    """
+                    INSERT INTO sessions (user_id, lane_id, status)
+                    VALUES (%s, %s, 'Active')
+                    RETURNING session_id
+                    """,
+                    (uid, lane_id),
+                    conn=conn,
+                )
+                if not new_sess:
+                    raise RuntimeError("Failed to create session row.")
+                sess_id = new_sess["session_id"]
 
-        # 3. Log Inward Weapon Event
-        evt_id = event_service.log_weapon_event(
-            user_id=uid,
-            session_id=sess_id,
-            weapon_type=weapon_name,
-            confidence=weapon_conf,
-            camera_id=camera_id,
-            lane_id=lane_id,
-            cooldown_cache=cooldown_cache,
-            cooldown_seconds=cooldown_seconds,
-        )
+            # 3. Log Inward Weapon Event
+            last_logged = cooldown_cache.get(cache_key)
+            cooldown_ok = True
+            if last_logged is not None:
+                elapsed = (now_dt - last_logged).total_seconds()
+                if elapsed < cooldown_seconds:
+                    cooldown_ok = False
 
-        now_str = datetime.now().strftime("%I:%M:%S %p")
+            evt_id = None
+            if cooldown_ok:
+                new_evt = fetch_one(
+                    """
+                    INSERT INTO weapon_events
+                        (session_id, user_id, weapon_type, confidence, camera_id, lane_id)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING event_id
+                    """,
+                    (sess_id, uid, weapon_name, round(weapon_conf, 4), camera_id, lane_id),
+                    conn=conn,
+                )
+                evt_id = new_evt["event_id"] if new_evt else None
+
+        # Post-commit: update in-memory caches and context state
+        if cooldown_ok and evt_id is not None:
+            cooldown_cache[cache_key] = now_dt
+
+        now_str = now_dt.strftime("%I:%M:%S %p")
         summary = {
             "tx_type": "CHECK_IN",
             "user_name": ctx.user_name,
@@ -192,11 +261,47 @@ class TransactionManager:
     @staticmethod
     def end_session_manually(session_id: int, user_id: int) -> Optional[Dict[str, Any]]:
         """
-        Manually check-out a shooter and end their range session from the desk panel.
+        Manually check-out a shooter and end their range session from the desk panel
+        inside an atomic database transaction.
         """
-        from services import session_service, attendance_service
-        # Close session
-        session_service.end_session(session_id)
-        # Close attendance
-        out_info = attendance_service.check_out_user(user_id)
-        return out_info
+        with transaction() as conn:
+            # 1. Close session
+            execute(
+                "UPDATE sessions SET end_time = NOW(), status = 'Completed' WHERE session_id = %s",
+                (session_id,),
+                conn=conn,
+            )
+            # 2. Close active attendance
+            active_att = fetch_one(
+                """
+                SELECT attendance_id, entry_time FROM attendance
+                WHERE user_id = %s AND status = 'Active'
+                ORDER BY entry_time DESC LIMIT 1
+                """,
+                (user_id,),
+                conn=conn,
+            )
+            att_id = None
+            entry_time = None
+            exit_time = datetime.now()
+            duration_minutes = 1
+
+            if active_att:
+                att_id = active_att["attendance_id"]
+                entry_time = active_att["entry_time"]
+                execute(
+                    "UPDATE attendance SET exit_time = NOW(), status = 'Completed' WHERE attendance_id = %s",
+                    (att_id,),
+                    conn=conn,
+                )
+                if entry_time:
+                    duration_secs = (exit_time - entry_time).total_seconds()
+                    duration_minutes = max(1, int(duration_secs // 60))
+
+        return {
+            "attendance_id": att_id,
+            "entry_time": entry_time,
+            "exit_time": exit_time,
+            "duration_minutes": duration_minutes,
+            "session_id": session_id,
+        }

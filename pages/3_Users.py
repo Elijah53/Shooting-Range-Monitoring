@@ -1,3 +1,4 @@
+import time
 import streamlit as st
 
 from database.database import require_db_or_stop
@@ -12,6 +13,16 @@ require_db_or_stop()
 settings = load_settings()
 
 st.title("Users")
+
+# Initialize session state for user face capture
+if "registration_capture_state" not in st.session_state:
+    st.session_state["registration_capture_state"] = "idle"
+if "registration_cam" not in st.session_state:
+    st.session_state["registration_cam"] = None
+if "registration_captured_frame" not in st.session_state:
+    st.session_state["registration_captured_frame"] = None
+if "pending_face_encoding" not in st.session_state:
+    st.session_state["pending_face_encoding"] = None
 
 tab_list, tab_register = st.tabs(["View / Manage Users", "Register User"])
 
@@ -43,7 +54,7 @@ with tab_list:
                     st.rerun()
 
 with tab_register:
-    st.markdown("Register a new user, then capture their face separately.")
+    st.markdown("Register a new user, then capture their face.")
 
     if not face_lib.FACE_LIB_AVAILABLE:
         st.warning(
@@ -53,36 +64,112 @@ with tab_register:
             f"Details: {face_lib.IMPORT_ERROR}"
         )
 
-    name = st.text_input("Full name")
-    phone = st.text_input("Phone number")
+    name = st.text_input("Full name", key="reg_user_name")
+    phone = st.text_input("Phone number", key="reg_user_phone")
 
-    capture_face = st.checkbox("Capture face now (uses webcam)", value=face_lib.FACE_LIB_AVAILABLE)
+    capture_face = st.checkbox("Capture face now (uses webcam)", value=face_lib.FACE_LIB_AVAILABLE, key="reg_chk_face")
 
-    captured_encoding = None
     if capture_face and face_lib.FACE_LIB_AVAILABLE:
-        if st.button("📷 Capture from webcam"):
-            try:
-                cam = Camera(settings.camera_source)
-                cam.start()
-                frame = cam.read_frame()
-                cam.stop()
-                try:
-                    encoding = face_lib.register_face(frame)
-                    st.session_state["pending_face_encoding"] = encoding
-                    st.image(frame[:, :, ::-1], caption="Captured frame", width=300)
-                    st.success("Face captured. Review the preview, then click Save User below.")
-                except face_lib.NoFaceDetectedError:
-                    st.error("No face detected in the captured frame. Try again.")
-                except face_lib.MultipleFacesDetectedError:
-                    st.error("Multiple faces detected. Make sure only one person is in frame.")
-            except CameraError as exc:
-                st.error(str(exc))
+        cap_state = st.session_state["registration_capture_state"]
 
-    if st.button("Save User"):
+        if cap_state == "idle":
+            st.caption("Click below to start live camera preview before taking photo.")
+            if st.button("▶ Start Camera Preview", type="primary", key="btn_start_preview"):
+                try:
+                    cam = Camera(settings.camera_source, target_fps=30)
+                    cam.start()
+                    st.session_state["registration_cam"] = cam
+                    st.session_state["registration_capture_state"] = "previewing"
+                    st.rerun()
+                except CameraError as exc:
+                    st.error(f"Camera Error: {exc}")
+
+        elif cap_state == "previewing":
+            cam = st.session_state.get("registration_cam")
+            if cam is None or not cam.is_open:
+                try:
+                    cam = Camera(settings.camera_source, target_fps=30)
+                    cam.start()
+                    st.session_state["registration_cam"] = cam
+                except CameraError as exc:
+                    st.error(f"Camera Error: {exc}")
+                    st.session_state["registration_capture_state"] = "idle"
+                    cam = None
+
+            if cam and cam.is_open:
+                frame = cam.read_frame()
+                if frame is not None:
+                    preview_box = st.empty()
+                    preview_box.image(frame, channels="RGB", caption="Live Preview — Center face and click 'Capture Photo'", width=480)
+
+                    btn_c1, btn_c2 = st.columns([2, 2])
+                    with btn_c1:
+                        if st.button("📸 Capture Photo", type="primary", key="btn_capture_frame", use_container_width=True):
+                            try:
+                                encoding = face_lib.register_face(frame)
+                                st.session_state["pending_face_encoding"] = encoding
+                                st.session_state["registration_captured_frame"] = frame
+                                st.session_state["registration_capture_state"] = "captured"
+                                if cam:
+                                    cam.stop()
+                                st.session_state["registration_cam"] = None
+                                st.rerun()
+                            except face_lib.NoFaceDetectedError:
+                                st.error("No face detected in the frame. Center your face and click Capture again.")
+                            except face_lib.MultipleFacesDetectedError:
+                                st.error("Multiple faces detected. Ensure only one person is in the frame.")
+                    with btn_c2:
+                        if st.button("⏹ Cancel Preview", key="btn_cancel_preview", use_container_width=True):
+                            if cam:
+                                cam.stop()
+                            st.session_state["registration_cam"] = None
+                            st.session_state["registration_capture_state"] = "idle"
+                            st.rerun()
+
+                    # Re-render next frame smoothly
+                    time.sleep(0.04)
+                    st.rerun()
+
+        elif cap_state == "captured":
+            captured_img = st.session_state.get("registration_captured_frame")
+            if captured_img is not None:
+                st.image(captured_img, channels="RGB", caption="Captured Face Confirmation Preview", width=360)
+            st.success("✅ Face verified and biometric encoding captured. Click 'Save User' below.")
+
+            if st.button("🔄 Retake Photo", key="btn_retake_photo"):
+                st.session_state["pending_face_encoding"] = None
+                st.session_state["registration_captured_frame"] = None
+                try:
+                    cam = Camera(settings.camera_source, target_fps=30)
+                    cam.start()
+                    st.session_state["registration_cam"] = cam
+                    st.session_state["registration_capture_state"] = "previewing"
+                    st.rerun()
+                except CameraError as exc:
+                    st.error(f"Camera Error: {exc}")
+                    st.session_state["registration_capture_state"] = "idle"
+
+    st.write("")
+    if st.button("Save User", type="primary" if st.session_state.get("registration_capture_state") == "captured" else "secondary"):
         if not name.strip():
             st.error("Name is required.")
         else:
+            # Clean up active camera if still running
+            active_cam = st.session_state.get("registration_cam")
+            if active_cam:
+                try:
+                    active_cam.stop()
+                except Exception:
+                    pass
+                st.session_state["registration_cam"] = None
+
             encoding = st.session_state.pop("pending_face_encoding", None)
             user_id = user_service.register_user(name.strip(), phone.strip(), encoding)
-            st.success(f"User '{name}' registered with ID {user_id}.")
+
+            # Reset capture state
+            st.session_state["registration_capture_state"] = "idle"
+            st.session_state["registration_captured_frame"] = None
+
+            st.success(f"User '{name}' registered successfully with ID {user_id}.")
+            time.sleep(0.5)
             st.rerun()

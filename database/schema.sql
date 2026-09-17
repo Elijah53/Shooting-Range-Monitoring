@@ -52,8 +52,17 @@ CREATE TABLE IF NOT EXISTS weapon_events (
     confidence  NUMERIC(5, 2) NOT NULL,
     detected_at TIMESTAMP DEFAULT NOW(),
     camera_id   VARCHAR(20) REFERENCES cameras(camera_id),
-    lane_id     VARCHAR(20)
+    lane_id     VARCHAR(20),
+    manual_weapon_type   VARCHAR(50),
+    manually_verified_by VARCHAR(100),
+    manually_verified_at TIMESTAMP
 );
+
+-- Additive migration for existing installations
+ALTER TABLE weapon_events
+    ADD COLUMN IF NOT EXISTS manual_weapon_type VARCHAR(50),
+    ADD COLUMN IF NOT EXISTS manually_verified_by VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS manually_verified_at TIMESTAMP;
 
 -- App settings: single-row table for runtime-configurable values.
 -- Editable via the Settings page; loaded at startup.

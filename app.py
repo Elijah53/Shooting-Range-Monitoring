@@ -60,7 +60,7 @@ def main():
 
     st.title("🎯 Shooting Range Attendance & Weapon Monitoring")
     st.markdown(
-        "Use the sidebar to open **Dashboard**, **Live Monitoring**, **Users**, "
+        "Use the sidebar to open **Dashboard**, **Check-In Station**, **Users**, "
         "**Sessions**, **Attendance**, **Weapon Events**, **Reports**, or **Settings**."
     )
     st.info(

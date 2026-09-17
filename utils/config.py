@@ -38,7 +38,7 @@ DB_USER: str = _get("DB_USER", "postgres")
 DB_PASSWORD: str = _get("DB_PASSWORD", "")
 
 # ── Vision ────────────────────────────────────────────────────────────────────
-WEAPON_MODEL_PATH: str = _get("WEAPON_MODEL_PATH", "model_data/weapon_model.pt")
+WEAPON_MODEL_PATH: str = _get("WEAPON_MODEL_PATH", "model_data/multi_weapon_model.pt")
 CAMERA_SOURCE: str = _get("CAMERA_SOURCE", "0")  # kept as str; cast to int in camera.py
 
 # ── Thresholds & Timing ───────────────────────────────────────────────────────
@@ -51,13 +51,13 @@ FACE_RECOGNITION_INTERVAL: int = _get("FACE_RECOGNITION_INTERVAL", 10, int)
 # ── Compatibility helper ───────────────────────────────────────────────────────
 class _Settings:
     """Simple namespace returned by load_settings() for backward compat."""
-    def __init__(self):
-        self.camera_source = CAMERA_SOURCE
-        self.face_match_threshold = FACE_MATCH_THRESHOLD
-        self.detection_confidence_threshold = DETECTION_CONFIDENCE_THRESHOLD
-        self.event_cooldown_seconds = EVENT_COOLDOWN_SECONDS
-        self.face_recognition_interval = FACE_RECOGNITION_INTERVAL
-        self.weapon_model_path = WEAPON_MODEL_PATH
+    def __init__(self, **kwargs):
+        self.camera_source = str(kwargs.get("camera_source", CAMERA_SOURCE))
+        self.face_match_threshold = float(kwargs.get("face_match_threshold", FACE_MATCH_THRESHOLD))
+        self.detection_confidence_threshold = float(kwargs.get("detection_confidence_threshold", DETECTION_CONFIDENCE_THRESHOLD))
+        self.event_cooldown_seconds = int(kwargs.get("event_cooldown_seconds", EVENT_COOLDOWN_SECONDS))
+        self.face_recognition_interval = int(kwargs.get("face_recognition_interval", FACE_RECOGNITION_INTERVAL))
+        self.weapon_model_path = str(kwargs.get("weapon_model_path", WEAPON_MODEL_PATH))
 
 def load_settings() -> _Settings:
     """Return a settings namespace (reads from DB if available, else .env)."""
